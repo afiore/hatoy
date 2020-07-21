@@ -1,50 +1,57 @@
 package com.example.imperative
 
 import java.time.LocalDateTime
-import java.util.concurrent.Executors
-import java.util.concurrent.TimeUnit
 
-import com.hazelcast.core.HazelcastInstance
+import org.apache.ignite.Ignite
+import org.apache.ignite.cache.query.ContinuousQuery
+import org.apache.ignite.services.Service
+import org.apache.ignite.services.ServiceContext
 import org.slf4j.LoggerFactory
 
-import scala.concurrent.duration._
 import scala.concurrent.duration.FiniteDuration
+import scala.concurrent.duration._
 
-class SingletonTask(hz: HazelcastInstance, interval: FiniteDuration, lockId: String)(logic: () => Unit) {
-  private val executor = Executors.newSingleThreadScheduledExecutor()
-  val logger           = LoggerFactory.getLogger(this.getClass)
+class SingletonTask(interval: FiniteDuration)(logic: () => Unit) extends Service {
 
-  executor.scheduleAtFixedRate(
-    () => {
-      val lock = hz.getCPSubsystem.getLock(lockId)
-      if (lock.tryLock()) {
-        logger.debug(s"got lock $lockId")
-        logic()
-      } else {
-        logger.debug(s"Couldn't get hold of lock $lockId")
-      }
-    },
-    0,
-    interval.toMillis,
-    TimeUnit.MILLISECONDS,
-  )
+  val logger = LoggerFactory.getLogger(this.getClass)
+
+  override def init(ctx: ServiceContext): Unit = ()
+
+  override def cancel(ctx: ServiceContext): Unit = ()
+
+  override def execute(ctx: ServiceContext): Unit =
+    while (!ctx.isCancelled) {
+      logic()
+      Thread.sleep(interval.toMillis)
+    }
 }
 object SingletonTask {
-  def currentWeather(hz: HazelcastInstance): SingletonTask = {
+  def currentWeather(ignite: Ignite): Unit = {
     val cities            = List("bari", "barcelona", "athens", "london", "paris", "chania", "new-york")
-    val currentWeatherMap = hz.getMap[String, CurrentWeather](Maps.currentWeather)
+    val currentWeatherMap = ignite.getOrCreateCache[String, CurrentWeather](Maps.currentWeather)
 
-    //executes only on the partition that owns the map key
-    currentWeatherMap.addLocalEntryListener(new WeatherChangeListener(hz))
+    // we execute a continuous query which will only receive updates for cache keys stored on local node (due to setLocal(true))
+    // NOTE: this returns a cursor which should be closed to free resources normally
+    currentWeatherMap.query(
+      new ContinuousQuery[String, CurrentWeather]
+        .setLocalListener(new WeatherChangeListener(ignite))
+        .setLocal(true),
+    )
 
-    new SingletonTask(hz, 30.seconds, Locks.currentWeather)(() =>
-      for (city <- cities) {
-        val conditions = scala.util.Random.shuffle(Conditions.values).head
-        currentWeatherMap.put(
-          city,
-          CurrentWeather(city, conditions, hz.getCluster.getLocalMember.getUuid, LocalDateTime.now()),
-        )
-      },
+    // "services" are a weird way of deploying executable threads of code, which we leverage to have a singleton
+    // TODO: investigate scheduling
+    ignite.services().deployClusterSingleton(
+      Locks.currentWeather,
+      new SingletonTask(30.seconds)(() =>
+        for (city <- cities) {
+
+          val conditions = scala.util.Random.shuffle(Conditions.values).head
+          currentWeatherMap.put(
+            city,
+            CurrentWeather(city, conditions, ignite.cluster().localNode().id(), LocalDateTime.now()),
+          )
+        },
+      ),
     )
   }
 }
